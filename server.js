@@ -65,16 +65,17 @@ async function connectDB() {
 
 // ==================== Schemas ====================
 const userSchema = new mongoose.Schema({
-    userId:        { type: Number, required: true, unique: true },
-    username:      String,
-    firstName:     String,
-    balance:       { type: Number, default: 0 },
-    referralCode:  { type: String, unique: true, sparse: true },
-    referredBy:    { type: Number, default: null },
-    inviteCount:   { type: Number, default: 0 },
-    taskCooldowns: { type: Map, of: Number, default: {} },
-    banned:        { type: Boolean, default: false },
-    createdAt:     { type: Date, default: Date.now }
+    userId:           { type: Number, required: true, unique: true },
+    username:         String,
+    firstName:        String,
+    balance:          { type: Number, default: 0 },
+    referralCode:     { type: String, unique: true, sparse: true },
+    referredBy:       { type: Number, default: null },
+    inviteCount:      { type: Number, default: 0 },
+    taskCooldowns:    { type: Map, of: Number, default: {} },
+    banned:           { type: Boolean, default: false },
+    pendingRefCode:   { type: String, default: null },  // persisted referral code while user joins channel
+    createdAt:        { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
 
@@ -113,7 +114,7 @@ const inviteSchema = new mongoose.Schema({
 const Invite = mongoose.model('Invite', inviteSchema);
 
 // ==================== Bot Helpers ====================
-const pendingStartParams = {};   // userId -> startParam (saved while user goes to join channel)
+// pendingStartParams removed — now persisted in User.pendingRefCode (DB-backed, survives restarts)
 
 async function botRequest(method, params) {
     if (!process.env.BOT_TOKEN) return null;
@@ -310,8 +311,41 @@ app.post('/api/bot', async (req, res) => {
                         chat_id: chatId,
                         message_id: cb.message.message_id
                     }).catch(() => {});
-                    const savedParam = pendingStartParams[userId] || '';
-                    delete pendingStartParams[userId];
+                    // Retrieve saved referral code from DB
+                    let savedParam = '';
+                    try {
+                        const savedUser = await User.findOne({ userId });
+                        savedParam = savedUser?.pendingRefCode || '';
+                        if (savedUser && savedUser.pendingRefCode) {
+                            savedUser.pendingRefCode = null;
+                            await savedUser.save();
+                        }
+                    } catch (e) {}
+
+                    // Award referral if applicable
+                    if (savedParam) {
+                        try {
+                            const existing = await User.findOne({ userId });
+                            if (!existing || !existing.referredBy) {
+                                const refUser = await User.findOne({ referralCode: savedParam });
+                                if (refUser && refUser.userId !== userId) {
+                                    const alreadyInvited = await Invite.findOne({ inviteeId: userId });
+                                    if (!alreadyInvited) {
+                                        refUser.balance    += INVITE_REWARD;
+                                        refUser.inviteCount += 1;
+                                        await refUser.save();
+                                        await Invite.create({ inviterId: refUser.userId, inviteeId: userId, inviteeName: firstName });
+                                        if (existing) { existing.referredBy = refUser.userId; await existing.save(); }
+                                        notifyUser(refUser.userId,
+                                            `🎉 ${firstName} သည် သင့် referral link မှ ဝင်ရောက်လာပါပြီ!\n` +
+                                            `💰 သင် ${INVITE_REWARD.toLocaleString()} ကျပ် ရရှိပါပြီ!\n` +
+                                            `👥 စုစုပေါင်း ဖိတ်ကြားထားသူ: ${refUser.inviteCount} ယောက်`
+                                        ).catch(() => {});
+                                    }
+                                }
+                            }
+                        } catch (e) { console.warn('Referral award error:', e.message); }
+                    }
                     await sendWelcomeMsg(chatId, firstName, savedParam);
                 } else {
                     await botRequest('answerCallbackQuery', {
@@ -363,30 +397,53 @@ app.post('/api/bot', async (req, res) => {
 
             const joined = await isChannelMember(userId);
             if (!joined) {
-                pendingStartParams[userId] = startParam;
+                // Persist referral code to DB (survives server restarts)
+                try {
+                    await User.updateOne(
+                        { userId },
+                        { $setOnInsert: { userId, firstName, username: msg.from?.username || '', referralCode: require('crypto').randomBytes(5).toString('hex') },
+                          $set: { pendingRefCode: startParam || null } },
+                        { upsert: true }
+                    );
+                } catch (e) { console.warn('Save pendingRefCode error:', e.message); }
                 await sendChannelJoinMsg(chatId, firstName);
             } else {
-                // Handle referral
-                if (startParam) {
+                // Handle referral — check startParam OR saved pendingRefCode from DB
+                let refCodeToUse = startParam;
+                if (!refCodeToUse) {
+                    try {
+                        const savedUser = await User.findOne({ userId });
+                        refCodeToUse = savedUser?.pendingRefCode || '';
+                        if (savedUser && savedUser.pendingRefCode) {
+                            savedUser.pendingRefCode = null;
+                            await savedUser.save();
+                        }
+                    } catch (e) {}
+                }
+                if (refCodeToUse) {
                     try {
                         const existing = await User.findOne({ userId });
-                        if (!existing) {
-                            const refUser = await User.findOne({ referralCode: startParam });
+                        if (!existing || !existing.referredBy) {
+                            const refUser = await User.findOne({ referralCode: refCodeToUse });
                             if (refUser && refUser.userId !== userId) {
-                                refUser.balance    += INVITE_REWARD;
-                                refUser.inviteCount += 1;
-                                await refUser.save();
-                                await Invite.create({ inviterId: refUser.userId, inviteeId: userId, inviteeName: firstName });
-                                notifyUser(refUser.userId,
-                                    `🎉 ${firstName} သည် သင့် referral link မှ ဝင်ရောက်လာပါပြီ!\n` +
-                                    `💰 သင် ${INVITE_REWARD.toLocaleString()} ကျပ် ရရှိပါပြီ!\n` +
-                                    `👥 စုစုပေါင်း ဖိတ်ကြားထားသူ: ${refUser.inviteCount} ယောက်`
-                                ).catch(() => {});
+                                const alreadyInvited = await Invite.findOne({ inviteeId: userId });
+                                if (!alreadyInvited) {
+                                    refUser.balance    += INVITE_REWARD;
+                                    refUser.inviteCount += 1;
+                                    await refUser.save();
+                                    await Invite.create({ inviterId: refUser.userId, inviteeId: userId, inviteeName: firstName });
+                                    if (existing) { existing.referredBy = refUser.userId; await existing.save(); }
+                                    notifyUser(refUser.userId,
+                                        `🎉 ${firstName} သည် သင့် referral link မှ ဝင်ရောက်လာပါပြီ!\n` +
+                                        `💰 သင် ${INVITE_REWARD.toLocaleString()} ကျပ် ရရှိပါပြီ!\n` +
+                                        `👥 စုစုပေါင်း ဖိတ်ကြားထားသူ: ${refUser.inviteCount} ယောက်`
+                                    ).catch(() => {});
+                                }
                             }
                         }
                     } catch (e) { console.warn('Referral via bot error:', e.message); }
                 }
-                await sendWelcomeMsg(chatId, firstName, startParam);
+                await sendWelcomeMsg(chatId, firstName, refCodeToUse || startParam);
             }
             return;
         }
