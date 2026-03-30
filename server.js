@@ -8,7 +8,7 @@ app.set('trust proxy', 1);
 
 // ==================== CORS & Middleware ====================
 app.use(cors({
-    origin: ['https://kyawngar-frontend.vercel.app', 'http://localhost:3000', '*'],
+    origin: ['https://kyawngarfrontend1.vercel.app', 'http://localhost:3000', '*'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
     allowedHeaders: ['Content-Type', 'X-Telegram-Init-Data', 'X-Admin-Key', 'X-Referral'],
     credentials: true
