@@ -1,1 +1,17 @@
-test
+services:
+  - type: web
+    name: kyawngar-backend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: NODE_ENV
+        value: production

@@ -1,1 +1,18 @@
-test
+{
+  "name": "kyawngar-backend",
+  "version": "1.0.0",
+  "description": "Kyawngar Telegram Mini App Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "mongoose": "^8.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
