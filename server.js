@@ -117,6 +117,8 @@ const withdrawalSchema = new mongoose.Schema({
   accountName:   String,
   status:        { type: String, enum: ['pending','approved','rejected'], default: 'pending' },
   rejectReason:  String,
+  feeScreenshot: { type: String, default: null }, // base64 or 'verified'
+  feeVerified:   { type: Boolean, default: false },
   createdAt:     { type: Date, default: Date.now }
 });
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
@@ -687,6 +689,32 @@ botAdminRouter.post('/giveminer', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// approve-wd (from bot inline button)
+botAdminRouter.post('/approve-wd', async (req, res) => {
+  try {
+    await connectDB();
+    const { withdrawalId } = req.body;
+    const w = await Withdrawal.findById(withdrawalId);
+    if (!w || w.status !== 'pending') return res.status(400).json({ error: 'Already processed or not found' });
+    w.status = 'approved'; w.feeVerified = true; await w.save();
+    res.json({ success: true, amount: w.amount, userId: w.userId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// reject-wd (from bot inline button)
+botAdminRouter.post('/reject-wd', async (req, res) => {
+  try {
+    await connectDB();
+    const { withdrawalId } = req.body;
+    const w = await Withdrawal.findById(withdrawalId);
+    if (!w || w.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
+    // Refund balance
+    await User.findOneAndUpdate({ userId: w.userId }, { $inc: { balance: w.amount } });
+    w.status = 'rejected'; await w.save();
+    res.json({ success: true, amount: w.amount, userId: w.userId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // /revokeminer — Revoke miner from user (admin command)
 botAdminRouter.post('/revokeminer', async (req, res) => {
   try {
@@ -872,7 +900,10 @@ app.post('/api/tasks/claim', authMiddleware, async (req, res) => {
 // ============================================================
 //  WITHDRAWAL
 // ============================================================
-app.post('/api/withdraw', authMiddleware, async (req, res) => {
+// Withdrawal with fee screenshot (multer)
+app.post('/api/withdraw', authMiddleware,
+  (req, res, next) => { upload.single('feeScreenshot')(req, res, err => { if (err) return handleMulterErr(err, req, res, next); next(); }); },
+  async (req, res) => {
   try {
     const { amount, method, accountNumber, accountName } = req.body;
     const amt = Number(amount);
@@ -882,23 +913,50 @@ app.post('/api/withdraw', authMiddleware, async (req, res) => {
     if (!accountNumber) return res.status(400).json({ error: 'Account number required' });
     if (req.user.balance < amt) return res.status(400).json({ error: 'လက်ကျန်ငွေ မလောက်ပါ' });
 
+    // Require fee screenshot for all methods
+    if (!req.file) return res.status(400).json({ error: 'ကြေးပေးပြီးကြောင်း Screenshot တင်ပါ' });
+
     req.user.balance -= amt; await req.user.save();
+    const feeBase64 = req.file.buffer.toString('base64');
     const w = await Withdrawal.create({
       userId: req.user.userId, firstName: req.user.firstName,
-      amount: amt, method, accountNumber, accountName, status: 'pending'
+      amount: amt, method, accountNumber, accountName, status: 'pending',
+      feeScreenshot: feeBase64, feeVerified: false
     });
 
     const mLabel = method === 'kpay' ? 'KBZ Pay' : 'Wave Pay';
-    notifyAdmin(
-      `💸 <b>ငွေထုတ်တောင်းဆိုမှု</b>\n` +
-      `👤 ${escHTML(req.user.firstName)} (${req.user.userId})\n` +
-      `💰 ${amt.toLocaleString()} ကျပ်\n` +
-      `🏦 ${mLabel}: ${escHTML(accountNumber)}\n` +
-      `👤 ${escHTML(accountName||'-')}\n\n` +
-      `✅ /approve_wd_${w._id}\n❌ /reject_wd_${w._id}`
-    );
+
+    // Send fee screenshot photo to admin via bot server
+    try {
+      const r = await fetch(`${BOT_URL}/send-withdrawal-photo`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: req.user.userId,
+          firstName: req.user.firstName,
+          withdrawalId: w._id.toString(),
+          amount: amt,
+          method: mLabel,
+          accountNumber,
+          accountName: accountName || '-',
+          screenshotBase64: feeBase64
+        }),
+        timeout: 15000
+      });
+    } catch (photoErr) {
+      // Fallback: text only
+      notifyAdmin(
+        `💸 <b>ငွေထုတ်တောင်းဆိုမှု (Fee Screenshot ပါသည်)</b>\n` +
+        `👤 ${escHTML(req.user.firstName)} (${req.user.userId})\n` +
+        `💰 ${amt.toLocaleString()} ကျပ်\n` +
+        `🏦 ${mLabel}: ${escHTML(accountNumber)}\n` +
+        `👤 ${escHTML(accountName||'-')}\n\n` +
+        `✅ /approve_wd_${w._id}\n❌ /reject_wd_${w._id}`
+      );
+    }
+
     res.json({ success: true, newBalance: req.user.balance, withdrawalId: w._id });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { console.error('Withdraw error:', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ============================================================
@@ -920,13 +978,15 @@ app.get('/api/invites', authMiddleware, async (req, res) => {
 app.get('/api/admin/stats', adminMiddleware, async (req, res) => {
   try {
     await connectDB();
-    const [totalUsers, totalMiners, pendingWithdrawals, pendingMiners] = await Promise.all([
+    const [totalUsers, totalMiners, pendingWithdrawals, pendingMiners, balanceAgg] = await Promise.all([
       User.countDocuments(),
       Miner.countDocuments({ status: 'active' }),
       Withdrawal.countDocuments({ status: 'pending' }),
-      Miner.find({ status: 'pending' }).sort({ createdAt: -1 }).limit(20)
+      Miner.find({ status: 'pending' }).sort({ createdAt: -1 }).limit(20),
+      User.aggregate([{ $group: { _id: null, total: { $sum: '$balance' } } }])
     ]);
-    res.json({ totalUsers, activeMiners: totalMiners, pendingWithdrawals, pendingMiners });
+    const totalBalance = balanceAgg[0]?.total || 0;
+    res.json({ totalUsers, activeMiners: totalMiners, pendingWithdrawals, pendingMiners, totalBalance });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
