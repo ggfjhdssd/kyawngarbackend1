@@ -54,7 +54,7 @@ function escHTML(s) {
 
 // ── Constants ─────────────────────────────────────────────────
 const TASK_COOLDOWN_MS = 3 * 60 * 1000;
-const MINE_RATE        = 300;
+const MINE_RATE        = 1000;
 const MINE_INTERVAL_MS = 10 * 60 * 1000;
 const MIN_WITHDRAWAL   = 50000;
 const INVITE_REWARD    = 2000;
@@ -62,7 +62,7 @@ const VALID_TASKS      = ['task1','task2','task3','task4','task5'];
 const TASK_REWARDS     = { task1:300, task2:300, task3:300, task4:300, task5:300 };
 const CHANNEL_ID       = process.env.CHANNEL_ID    || '@freeeemoneeeyi';
 const BOT_URL          = process.env.BOT_URL        || 'http://localhost:3001'; // bot server URL
-const SLOT_PRICES      = { 1: 3000, 2: 5000, 3: 10000 };
+const SLOT_PRICES      = { 1: 20000, 2: 20000, 3: 20000 };
 
 // ── MongoDB ────────────────────────────────────────────────────
 let cachedDb = null, connProm = null;
@@ -99,6 +99,7 @@ const minerSchema = new mongoose.Schema({
   userId:      { type: Number, required: true },
   slotIndex:   { type: Number, required: true },
   status:      { type: String, enum: ['pending','active','rejected','stopped'], default: 'pending' },
+  grantedByAdmin: { type: Boolean, default: false },
   approvedAt:  { type: Number, default: 0 },
   lastCollect: { type: Number, default: 0 },
   totalEarned: { type: Number, default: 0 },
@@ -437,7 +438,7 @@ async function _approveMiner(minerId, adminChatId) {
     await miner.save();
     notifyUser(miner.userId,
       `✅ <b>Miner #${miner.slotIndex} Activate ပြုလုပ်ပြီးပါပြီ!</b>\n` +
-      `Admin မှ confirm ပေးပါပြီ\nယခု ၁၀ မိနစ်တိုင်း ၃၀၀ ကျပ် ⛏️💰`
+      `Admin မှ confirm ပေးပါပြီ\nယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် ⛏️💰`
     );
     botReq('sendMessage',{chat_id:adminChatId,text:`✅ Miner #${miner.slotIndex} ခွင့်ပြုပြီး (User: ${miner.userId})`});
   } catch (e) { botReq('sendMessage',{chat_id:adminChatId,text:'❌ Error: '+e.message}); }
@@ -649,6 +650,61 @@ botAdminRouter.get('/userinfo/:userId', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// /giveminer — Grant miner to user without payment (admin command)
+botAdminRouter.post('/giveminer', async (req, res) => {
+  try {
+    await connectDB();
+    const { userId, slotIndex } = req.body;
+    if (!userId || ![1,2,3].includes(Number(slotIndex))) {
+      return res.status(400).json({ error: 'Invalid params. slotIndex must be 1,2,3' });
+    }
+
+    // Check existing
+    const existing = await Miner.findOne({ userId: Number(userId), slotIndex: Number(slotIndex) });
+    if (existing && existing.status === 'active') {
+      return res.status(400).json({ error: 'Miner already active for this slot' });
+    }
+
+    let miner;
+    if (existing) {
+      existing.status = 'active';
+      existing.approvedAt = Date.now();
+      existing.lastCollect = Date.now();
+      existing.grantedByAdmin = true;
+      await existing.save();
+      miner = existing;
+    } else {
+      miner = await Miner.create({
+        userId: Number(userId),
+        slotIndex: Number(slotIndex),
+        status: 'active',
+        approvedAt: Date.now(),
+        lastCollect: Date.now(),
+        grantedByAdmin: true
+      });
+    }
+    res.json({ success: true, minerId: miner._id, slotIndex: miner.slotIndex });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// /revokeminer — Revoke miner from user (admin command)
+botAdminRouter.post('/revokeminer', async (req, res) => {
+  try {
+    await connectDB();
+    const { userId, slotIndex } = req.body;
+    if (!userId || ![1,2,3].includes(Number(slotIndex))) {
+      return res.status(400).json({ error: 'Invalid params' });
+    }
+    const miner = await Miner.findOneAndUpdate(
+      { userId: Number(userId), slotIndex: Number(slotIndex) },
+      { $set: { status: 'stopped' } },
+      { new: true }
+    );
+    if (!miner) return res.status(404).json({ error: 'Miner not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.use('/api/admin/bot', botAdminRouter);
 
 // ============================================================
@@ -771,7 +827,7 @@ app.post('/api/admin/miners/:minerId/approve', adminMiddleware, async (req, res)
     miner.status = 'active'; miner.approvedAt = Date.now(); miner.lastCollect = Date.now();
     await miner.save();
     notifyUser(miner.userId,
-      `✅ <b>Miner #${miner.slotIndex} Activate ပြုလုပ်ပြီးပါပြီ!</b>\nယခု ၁၀ မိနစ်တိုင်း ၃၀၀ ကျပ် ⛏️💰`
+      `✅ <b>Miner #${miner.slotIndex} Activate ပြုလုပ်ပြီးပါပြီ!</b>\nယခု ၁၀ မိနစ်တိုင်း 1,000 ကျပ် ⛏️💰`
     );
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
