@@ -132,6 +132,25 @@ const inviteSchema = new mongoose.Schema({
 });
 const Invite = mongoose.model('Invite', inviteSchema);
 
+// ── Settings Schema (VPN toggle, min withdrawal, fee) ─────────
+const settingsSchema = new mongoose.Schema({
+  key:   { type: String, required: true, unique: true },
+  value: { type: mongoose.Schema.Types.Mixed, required: true }
+});
+const Settings = mongoose.model('Settings', settingsSchema);
+
+// ── Settings helper ─────────────────────────────────────────
+async function getSetting(key, defaultVal) {
+  try {
+    const doc = await Settings.findOne({ key });
+    return doc ? doc.value : defaultVal;
+  } catch { return defaultVal; }
+}
+
+async function setSetting(key, value) {
+  return Settings.findOneAndUpdate({ key }, { value }, { upsert: true, new: true });
+}
+
 // ── Telegram Bot API calls ────────────────────────────────────
 async function botReq(method, params) {
   if (!process.env.BOT_TOKEN) return null;
@@ -255,8 +274,32 @@ function computePendingEarnings(miner) {
 }
 
 // ============================================================
-//  HEALTH
+//  PUBLIC SETTINGS  (Frontend မှ ခေါ်သော — Auth မလို)
 // ============================================================
+app.get('/api/settings/public', async (req, res) => {
+  try {
+    await connectDB();
+    const [vpnRequired, minWithdrawal, withdrawalFee] = await Promise.all([
+      getSetting('vpnRequired', false),
+      getSetting('minWithdrawal', 50000),
+      getSetting('withdrawalFee', 5000)
+    ]);
+    res.json({ vpnRequired, minWithdrawal, withdrawalFee });
+  } catch (e) {
+    res.json({ vpnRequired: false, minWithdrawal: 50000, withdrawalFee: 5000 });
+  }
+});
+
+// VPN status check (for frontend task watch)
+app.get('/api/settings/vpn-status', async (req, res) => {
+  try {
+    await connectDB();
+    const vpnRequired = await getSetting('vpnRequired', false);
+    res.json({ vpnRequired });
+  } catch (e) {
+    res.json({ vpnRequired: false });
+  }
+});
 app.get('/api/health', (_req, res) => res.json({
   status: 'ok', time: new Date().toISOString(),
   env: { mongoUri: !!process.env.MONGODB_URI, botToken: !!process.env.BOT_TOKEN }
@@ -689,7 +732,52 @@ botAdminRouter.post('/giveminer', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// approve-wd (from bot inline button)
+// /setvpn — Enable VPN requirement
+botAdminRouter.post('/setvpn', async (req, res) => {
+  try {
+    await connectDB();
+    const { enabled } = req.body; // true or false
+    await setSetting('vpnRequired', enabled === true || enabled === 'true');
+    res.json({ success: true, vpnRequired: enabled });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// /setmin — Set minimum withdrawal amount
+botAdminRouter.post('/setmin', async (req, res) => {
+  try {
+    await connectDB();
+    const { amount } = req.body;
+    if (!amount || isNaN(amount) || Number(amount) < 1000)
+      return res.status(400).json({ error: 'Invalid amount (min 1000)' });
+    await setSetting('minWithdrawal', Number(amount));
+    res.json({ success: true, minWithdrawal: Number(amount) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// /setfee — Set withdrawal fee
+botAdminRouter.post('/setfee', async (req, res) => {
+  try {
+    await connectDB();
+    const { amount } = req.body;
+    if (amount === undefined || isNaN(amount) || Number(amount) < 0)
+      return res.status(400).json({ error: 'Invalid fee amount' });
+    await setSetting('withdrawalFee', Number(amount));
+    res.json({ success: true, withdrawalFee: Number(amount) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// /getsettings — Get current settings
+botAdminRouter.get('/getsettings', async (req, res) => {
+  try {
+    await connectDB();
+    const [vpnRequired, minWithdrawal, withdrawalFee] = await Promise.all([
+      getSetting('vpnRequired', false),
+      getSetting('minWithdrawal', 50000),
+      getSetting('withdrawalFee', 5000)
+    ]);
+    res.json({ success: true, vpnRequired, minWithdrawal, withdrawalFee });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 botAdminRouter.post('/approve-wd', async (req, res) => {
   try {
     await connectDB();
@@ -907,8 +995,15 @@ app.post('/api/withdraw', authMiddleware,
   try {
     const { amount, method, accountNumber, accountName } = req.body;
     const amt = Number(amount);
-    if (isNaN(amt) || amt < MIN_WITHDRAWAL)
-      return res.status(400).json({ error: `အနည်းဆုံး ${MIN_WITHDRAWAL.toLocaleString()} ကျပ် ရှိမှ ထုတ်နိုင်သည်` });
+
+    // Load dynamic settings
+    const [minWithdrawal, withdrawalFee] = await Promise.all([
+      getSetting('minWithdrawal', 50000),
+      getSetting('withdrawalFee', 5000)
+    ]);
+
+    if (isNaN(amt) || amt < minWithdrawal)
+      return res.status(400).json({ error: `အနည်းဆုံး ${minWithdrawal.toLocaleString()} ကျပ် ရှိမှ ထုတ်နိုင်သည်` });
     if (!['kpay','wavepay'].includes(method)) return res.status(400).json({ error: 'Invalid method' });
     if (!accountNumber) return res.status(400).json({ error: 'Account number required' });
     if (req.user.balance < amt) return res.status(400).json({ error: 'လက်ကျန်ငွေ မလောက်ပါ' });
