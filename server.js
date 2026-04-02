@@ -350,10 +350,11 @@ app.get('/api/check-vpn', async (req, res) => {
       return res.json({ allowed: true, isAdmin: false, country: 'Unknown', countryCode: 'XX' });
     }
 
-    // 5. Block only Myanmar
-    const blocked = countryCode === 'MM';
+    // 5. Whitelist check: only US, SG, FI, FR are allowed
+    const ALLOWED_COUNTRIES = ['US', 'SG', 'FI', 'FR'];
+    const allowed = ALLOWED_COUNTRIES.includes(countryCode);
     return res.json({
-      allowed:     !blocked,
+      allowed,
       isAdmin:     false,
       country:     countryName,
       countryCode: countryCode
