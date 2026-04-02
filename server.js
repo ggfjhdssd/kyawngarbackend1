@@ -306,6 +306,67 @@ app.get('/api/health', (_req, res) => res.json({
 }));
 
 // ============================================================
+//  VPN CHECK  — Block Myanmar (MM), allow all other countries
+//  Admin bypass: isAdmin === true skips country check entirely
+// ============================================================
+app.get('/api/check-vpn', async (req, res) => {
+  try {
+    await connectDB();
+
+    // 1. Get IP
+    const ip =
+      req.headers['cf-connecting-ip'] ||      // Cloudflare
+      req.headers['x-real-ip'] ||
+      (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+      req.socket.remoteAddress ||
+      '';
+
+    // 2. Check if requester is admin (parse initData)
+    let isAdmin = false;
+    const initData = req.headers['x-telegram-init-data'] || '';
+    const tgUser   = parseTgUser(initData);
+    if (tgUser?.id && process.env.ADMIN_ID) {
+      isAdmin = String(tgUser.id) === String(process.env.ADMIN_ID);
+    }
+
+    // 3. Admin bypass — skip location check entirely
+    if (isAdmin) {
+      return res.json({ allowed: true, isAdmin: true, country: 'Admin', countryCode: 'ADMIN' });
+    }
+
+    // 4. Geo lookup via ip-api.com (free, no key needed)
+    let countryCode = '';
+    let countryName = '';
+    try {
+      const geoRes  = await fetch(`http://ip-api.com/json/${ip}?fields=status,countryCode,country`, { signal: AbortSignal.timeout(5000) });
+      const geoData = await geoRes.json();
+      if (geoData.status === 'success') {
+        countryCode = geoData.countryCode || '';
+        countryName = geoData.country     || '';
+      }
+    } catch (geoErr) {
+      console.warn('Geo lookup failed:', geoErr.message);
+      // On geo failure, allow to avoid blocking legitimate users
+      return res.json({ allowed: true, isAdmin: false, country: 'Unknown', countryCode: 'XX' });
+    }
+
+    // 5. Block only Myanmar
+    const blocked = countryCode === 'MM';
+    return res.json({
+      allowed:     !blocked,
+      isAdmin:     false,
+      country:     countryName,
+      countryCode: countryCode
+    });
+
+  } catch (e) {
+    console.error('/api/check-vpn error:', e.message);
+    // On server error, allow to avoid blocking legitimate users
+    res.json({ allowed: true, isAdmin: false, country: 'Unknown', countryCode: 'XX' });
+  }
+});
+
+// ============================================================
 //  BOT WEBHOOK  (Telegram webhook fallback if needed)
 // ============================================================
 app.post('/api/bot', async (req, res) => {
